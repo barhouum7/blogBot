@@ -1,0 +1,4 @@
+python-dotenv==1.0.0
+numpy==1.24.3
+selenium==4.9.1
+fake-useragent==1.1.3
