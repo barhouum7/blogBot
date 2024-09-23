@@ -6,6 +6,23 @@ __pycache__/
 # C extensions
 *.so
 
+# Selenium
+geckodriver.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Screenshots
+*.png
+
+# Temporary files
+*.tmp
+
 # Distribution / packaging
 .Python
 build/
