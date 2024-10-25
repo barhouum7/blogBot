@@ -3,6 +3,7 @@ import os
 import numpy as np
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -10,19 +11,28 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException, WebDriverException, NoAlertPresentException, StaleElementReferenceException
 import random
 import time
+from datetime import timedelta
 import logging
 import subprocess
 from fake_useragent import UserAgent
 
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from webdriver_manager.firefox import GeckoDriverManager
+
 class BlogBot:
-    def __init__(self, url, use_vpn=False, vpn_location=None, window_size=(1280, 720)):
+    def __init__(self, url, use_vpn=False, vpn_location=None, max_retries=3, window_size=(1280, 720), geckodriver_path=None):
         load_dotenv()
         self.setup_logging()
 
         # Load environment variables
         self.main_url = os.getenv('MAIN_URL')
         self.url = url if url else self.main_url  # Use provided URL or fall back to MAIN_URL
-        
+
+        self.max_ads_to_click = 30  # Define the target number of ads to click
+        self.ad_click_timeout = 30 * 60  # Set a timeout for ad clicks in seconds (e.g., 30 minutes)
+        self.start_time = None
+
         # Debug logging
         self.logger.info(f"Initializing BlogBot with URL: {self.url}")
         
@@ -30,52 +40,304 @@ class BlogBot:
             raise ValueError("No valid URL provided. Please check your .env file or provide a URL.")
         
         self.ua = UserAgent()
+
+        # self.user_agents = self.generate_user_agent_list()
         self.window_size = window_size
         self.driver = None
         self.total_ads_clicked = 0
         self.clicked_ads = set()  # This set will store unique ad identifiers
+        
+        # ******************** Firefox Setup ********************
+        # self.options = FirefoxOptions()
+        # self.options.add_argument('-private')  # This enables incognito mode in Firefox
+        # self.options.add_argument(f'--width={self.window_size[0]}')
+        # self.options.add_argument(f'--height={self.window_size[1]}')
+        # self.options.set_preference("dom.webdriver.enabled", False)
+        # self.options.set_preference('useAutomationExtension', False)
+        # self.options.set_preference("general.useragent.override", self.ua.random)
+        # self.geckodriver_path = geckodriver_path or r'C:\Program Files\geckodriver-v0.35.0-win64\geckodriver.exe'  # Updated default path
+
+        # ******************** Chrome Setup ********************
+        self.options = Options()
+        self.options.add_argument(f'--window-size={self.window_size[0]},{self.window_size[1]}')
+        self.options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        self.options.add_experimental_option('useAutomationExtension', False)
+        # user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36'
+        # self.options.add_argument(f'user-agent={user_agent}')
+        self.options.add_argument(f'user-agent={self.ua.random}')
+        self.options.add_argument("--disable-blink-features=AutomationControlled")
+        self.options.add_argument("--start-maximized")
+        self.options.add_argument("--disable-extensions")
+        self.options.add_argument("--disable-popup-blocking")
+        self.options.add_argument('--no-sandbox')
+        self.options.add_argument('--disable-gpu')
+        self.options.add_argument('--disable-infobars')
+        # Disable SSL verification
+        self.options.add_argument('--ignore-certificate-errors')
+        self.options.add_argument('--ignore-ssl-errors')
+        # This can help bypass some anti-bot measures
+        self.options.add_argument(f'user-data-dir={os.path.expanduser("~")}/chrome-data')
+
+        # To enable incognito mode
+        self.options.add_argument("--incognito")
+
 
         if use_vpn:
             self.connect_vpn(vpn_location)
-        self.setup_driver()
+        
+        self.driver = self.initialize_driver(max_retries)
+        # self.driver.set_page_load_timeout(60)  # 60 seconds timeout
+        self.wait = WebDriverWait(self.driver, 30)  # Increased default wait time
 
     def setup_logging(self):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
 
-    def setup_driver(self):
-        options = webdriver.ChromeOptions()
-        options.add_argument(f'--window-size={self.window_size[0]},{self.window_size[1]}')
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-        options.add_argument(f'user-agent={self.ua.random}')
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--start-maximized")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-popup-blocking")
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-infobars')
+    def generate_user_agent_list(self):
+        # Generate a list of diverse user agents
+        browsers = ['chrome', 'firefox', 'safari', 'opera']
+        platforms = ['windows', 'macos', 'linux']
+        user_agents = []
+        for _ in range(50):  # Generate 50 unique user agents
+            browser = random.choice(browsers)
+            platform = random.choice(platforms)
+            try:
+                user_agents.append(self.ua[f'{browser} {platform}'])
+            except KeyError as e:
+                self.logger.warning(f"Error occurred during getting browser: {browser}{platform}, but was suppressed with fallback. Error: {e}")
+                # If the specific combination is not available, use a random user agent
+                user_agents.append(self.ua.random)
+        return list(set(user_agents))  # Remove duplicates
 
-        # To enable incognito mode
-        options.add_argument("--incognito")
+    def get_random_user_agent(self):
+        return random.choice(self.user_agents)
 
+
+    def initialize_driver(self, max_retries):
+        for attempt in range(max_retries):
+            try:
+                # ******************** FireFox Setup ********************
+                # if not os.path.exists(self.geckodriver_path):
+                #     raise FileNotFoundError(f"Geckodriver not found at {self.geckodriver_path}")
+                
+                # service = Service(self.geckodriver_path)
+                # driver = webdriver.Firefox(service=service, options=self.options)
+
+                # ******************** Chrome Setup ********************
+                service = Service(r"C:\Program Files\chromedriver-win64\chromedriver.exe")
+                # user_agent = self.get_random_user_agent()
+                # self.options.add_argument(f'user-agent={user_agent}')
+                self.logger.info(f"Using User Agent: {self.ua.random}")
+                driver = webdriver.Chrome(service=service, options=self.options)
+
+
+                # # Randomize screen and viewport size
+                # width = random.randint(1024, 1920)
+                # height = random.randint(768, 1080)
+                # driver.set_window_size(width, height)
+                # print(f"Set window size to {width}x{height}")
+                # driver.set_window_size(*self.window_size)
+                # print(f"Set window size to {self.window_size[0]}x{self.window_size[1]}")
+                
+                # Disable WebDriver flags
+                self.disable_webdriver_flags(driver)
+                
+                # # After initializing the driver, get and print the initial fingerprint
+                # initial_fingerprint = self.get_current_fingerprint()
+                # if initial_fingerprint:
+                #     self.print_fingerprint(initial_fingerprint, "Initial Fingerprint")
+
+                return driver
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    print("Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    raise Exception("Failed to initialize WebDriver after multiple attempts")
+
+    # def initialize_driver(self, max_retries):
+        # ******************** Chrome Setup ********************
+        # options = webdriver.ChromeOptions()
+        # options.add_argument(f'--window-size={self.window_size[0]},{self.window_size[1]}')
+        # options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        # options.add_experimental_option('useAutomationExtension', False)
+        # options.add_argument(f'user-agent={self.ua.random}')
+        # options.add_argument("--disable-blink-features=AutomationControlled")
+        # options.add_argument("--start-maximized")
+        # options.add_argument("--disable-extensions")
+        # options.add_argument("--disable-popup-blocking")
+        # options.add_argument('--no-sandbox')
+        # options.add_argument('--disable-gpu')
+        # options.add_argument('--disable-infobars')
+
+        # # To enable incognito mode
+        # options.add_argument("--incognito")
+
+        # try:
+        #     service = Service(r"C:\Program Files\chromedriver-win64\chromedriver.exe")
+        #     self.driver = webdriver.Chrome(service=service, options=options)
+        #     self.disable_webdriver_flags()
+        #     self.logger.info(f"Initialized browser with User-Agent: {self.ua.random}")
+        # except Exception as e:
+        #     self.logger.error(f"Failed to initialize WebDriver: {e}")
+        #     raise
+
+        # ******************** Chrome Setup ********************
+        # ******************** Firefox Setup ********************
+        # options = FirefoxOptions()
+        # options.add_argument('-private')  # This enables incognito mode in Firefox
+        # options.add_argument(f'--width={self.window_size[0]}')
+        # options.add_argument(f'--height={self.window_size[1]}')
+        # options.set_preference("dom.webdriver.enabled", False)
+        # options.set_preference('useAutomationExtension', False)
+        # options.set_preference("general.useragent.override", self.ua.random)
+
+        # try:
+        #     service = FirefoxService(GeckoDriverManager().install())
+        #     self.driver = webdriver.Firefox(service=service, options=options)
+        #     self.driver.set_page_load_timeout(30)  # Set page load timeout here
+        #     self.disable_webdriver_flags()
+        #     self.logger.info(f"Initialized Firefox browser with User-Agent: {self.ua.random}")
+        # except Exception as e:
+        #     self.logger.error(f"Failed to initialize WebDriver: {e}")
+        #     raise
+        # ******************** Firefox Setup ********************
+
+
+    def get_current_fingerprint(self):
         try:
-            service = Service(r"C:\Program Files\chromedriver-win64\chromedriver.exe")
-            self.driver = webdriver.Chrome(service=service, options=options)
-            self.disable_webdriver_flags()
-            self.logger.info(f"Initialized browser with User-Agent: {self.ua.random}")
+            fingerprint = {
+                "user_agent": self.driver.execute_script("return navigator.userAgent;"),
+                "hardware_concurrency": self.driver.execute_script("return navigator.hardwareConcurrency;"),
+                "device_memory": self.driver.execute_script("return navigator.deviceMemory;"),
+                "webgl_vendor": self.driver.execute_script("var canvas = document.createElement('canvas'); var gl = canvas.getContext('webgl'); return gl.getParameter(gl.VENDOR);"),
+                "webgl_renderer": self.driver.execute_script("var canvas = document.createElement('canvas'); var gl = canvas.getContext('webgl'); return gl.getParameter(gl.RENDERER);"),
+                "languages": self.driver.execute_script("return navigator.languages;"),
+                "plugins_length": self.driver.execute_script("return navigator.plugins.length;"),
+                "screen_width": self.driver.execute_script("return screen.width;"),
+                "screen_height": self.driver.execute_script("return screen.height;"),
+            }
+            return fingerprint
         except Exception as e:
-            self.logger.error(f"Failed to initialize WebDriver: {e}")
-            raise
+            self.logger.error(f"Error getting current fingerprint: {e}")
+            return None
 
-    def disable_webdriver_flags(self):
-        script = """
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        """
-        self.driver.execute_script(script)
+    def print_fingerprint(self, fingerprint, message="Current Fingerprint"):
+        self.logger.info(f"--- {message} ---")
+        for key, value in fingerprint.items():
+            self.logger.info(f"{key}: {value}")
+        self.logger.info("-------------------")
+
+    def verify_fingerprint(self):
+        try:
+            current_fingerprint = self.get_current_fingerprint()
+            if current_fingerprint:
+                self.print_fingerprint(current_fingerprint)
+                
+                # Check only critical fingerprint elements
+                expected_ua = self.options.arguments[-1].split('=', 1)[1]
+                if current_fingerprint['user_agent'] != expected_ua:
+                    self.logger.warning(f"User agent mismatch. Expected: {expected_ua}, Actual: {current_fingerprint['user_agent']}")
+                    return False
+                
+                # Add more lenient checks for other fingerprint elements if needed
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Error verifying fingerprint: {e}")
+            return False
+
+    def verify_user_agent(self):
+        try:
+            actual_user_agent = self.driver.execute_script("return navigator.userAgent;")
+            expected_user_agent = self.options.arguments[-1].split('=', 1)[1]
+            self.logger.info(f"Actual User Agent: {actual_user_agent}")
+            if actual_user_agent != expected_user_agent:
+                self.logger.warning(f"User agent mismatch. Expected: {expected_user_agent}, Actual: {actual_user_agent}")
+                return False
+            return True
+        except Exception as e:
+            self.logger.error(f"Error verifying user agent: {e}")
+            return False
+
+
+    def disable_webdriver_flags(self, driver):
+        try:
+            driver.execute_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+            driver.execute_script("""
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+            """)
+            driver.execute_script("""
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+            """)
+            # # Randomize navigator properties
+            # driver.execute_script("""
+            #     Object.defineProperty(navigator, 'hardwareConcurrency', {
+            #         get: () => Math.floor(Math.random() * 8) + 2
+            #     });
+            #     Object.defineProperty(navigator, 'deviceMemory', {
+            #         get: () => Math.pow(2, Math.floor(Math.random() * 4) + 1)
+            #     });
+            # """)
+        except Exception as e:
+            self.logger.error(f"Error disabling WebDriver flags: {e}")
+
+    # # Randomize WebGL fingerprint
+    #     try:
+    #         driver.execute_script("""
+    #             const getParameter = WebGLRenderingContext.prototype.getParameter;
+    #             WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    #                 if (parameter === 37445) return 'Intel Open Source Technology Center';
+    #                 if (parameter === 37446) return 'Mesa DRI Intel(R) HD Graphics (Skylake GT2)';
+    #                 return getParameter.apply(this, arguments);
+    #             };
+    #         """)
+    #     except Exception as e:
+    #         self.logger.error(f"Error randomizing WebGL fingerprint: {e}")
+
+    #     # After applying all changes, get and print the new fingerprint
+    #     new_fingerprint = self.get_current_fingerprint()
+    #     if new_fingerprint:
+    #         self.print_fingerprint(new_fingerprint, "New Fingerprint After Disabling WebDriver Flags")
+
+
+    def handle_stuck_situation(self):
+        self.logger.warning("Detected a potentially stuck situation. Attempting to recover...")
+        try:
+            self.driver.execute_script("window.stop();")
+            self.driver.get(self.main_url)
+            WebDriverWait(self.driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            self.logger.info("Successfully recovered from stuck situation")
+        except Exception as e:
+            self.logger.error(f"Failed to recover from stuck situation: {e}")
+            self.reconnect_browser()
+
+
+    def is_page_stuck(self):
+        try:
+            # Check if the page is still loading
+            return self.driver.execute_script("return document.readyState") == "loading"
+        except:
+            # If we can't execute JavaScript, assume we're stuck
+            return True
+
+    
+    # def disable_webdriver_flags(self):
+    #     script = """
+    #         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    #         Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+    #         Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+    #     """
+    #     self.driver.execute_script(script)
 
 
     def connect_vpn(self, location, max_retries=3):
@@ -150,7 +412,9 @@ class BlogBot:
         
         for attempt in range(max_retries):
             try:
+                self.logger.info(f"Navigation attempt {attempt + 1}")
                 self.driver.get(target_url)
+                self.logger.info(f"Successfully loaded URL: {self.driver.current_url}")
                 self.wait_for_page_load()
                 self.handle_privacy_overlay()
                 if target_url in self.driver.current_url:
@@ -285,8 +549,57 @@ class BlogBot:
         for attempt in range(max_retries):
             try:
                 WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(element))
-                element.click()
-                return True
+                
+                # Check if highlightClick is defined
+                is_highlight_defined = self.driver.execute_script("return typeof highlightClick === 'function';")
+                if not is_highlight_defined:
+                    self.logger.warning("highlightClick is not defined. Attempting to reinject the script.")
+                    if not self.inject_highlight_script():
+                        self.logger.warning("Failed to reinject highlight script. Proceeding without highlighting.")
+                
+                rect = element.rect
+                click_points = [
+                    (rect['x'] + rect['width'] * 0.2, rect['y'] + rect['height'] * 0.2),
+                    (rect['x'] + rect['width'] * 0.8, rect['y'] + rect['height'] * 0.2),
+                    (rect['x'] + rect['width'] * 0.2, rect['y'] + rect['height'] * 0.8),
+                    (rect['x'] + rect['width'] * 0.8, rect['y'] + rect['height'] * 0.8),
+                    (rect['x'] + rect['width'] * 0.5, rect['y'] + rect['height'] * 0.5)
+                ]
+                click_point = random.choice(click_points)
+                
+                if is_highlight_defined or self.inject_highlight_script():
+                    try:
+                        self.driver.execute_script("highlightClick(arguments[0], arguments[1], arguments[2]);", 
+                                                   click_point[0], 
+                                                   click_point[1], 
+                                                   500)
+                    except Exception as e:
+                        self.logger.warning(f"Highlight click failed: {e}")
+                
+                # Hover on the element before clicking
+                ActionChains(self.driver).move_to_element(element).perform()
+                self.logger.info("Hovered on the element")
+                
+                # Try all click methods
+                click_methods = [
+                    lambda: element.click(),
+                    lambda: self.driver.execute_script("arguments[0].click();", element),
+                    lambda: ActionChains(self.driver).click().perform(),
+                    lambda: ActionChains(self.driver).move_to_element_with_offset(element, click_point[0] - rect['x'], click_point[1] - rect['y']).click().perform(),
+                    lambda: self.driver.execute_script(f"document.elementFromPoint({click_point[0]}, {click_point[1]}).click();")
+                ]
+                
+                for method in click_methods:
+                    try:
+                        method()
+                        self.logger.info(f"Successfully clicked element using method: {method.__name__}")
+                        return True
+                    except Exception as e:
+                        self.logger.warning(f"Click method {method.__name__} failed: {e}")
+                
+                self.logger.error("All click methods failed.")
+                return False
+            
             except StaleElementReferenceException:
                 if attempt == max_retries - 1:
                     self.logger.warning("Element became stale. Max retries reached.")
@@ -540,10 +853,12 @@ class BlogBot:
             (By.CSS_SELECTOR, "iframe[src*='googleadservices']"),
             (By.CSS_SELECTOR, "div[id^='google_ads_iframe']"),
             (By.XPATH, "//iframe[contains(@id, 'google_ads_iframe')]"),
+            (By.CSS_SELECTOR, "div[id^='ad-']"),
             (By.CSS_SELECTOR, "div[class*='ad-']"),
-            (By.CSS_SELECTOR, "div[id*='ad-']"),
             (By.CSS_SELECTOR, "div[class*='advertisement']"),
-            (By.CSS_SELECTOR, "div[id*='advertisement']")
+            ('css selector', 'ins.adsbygoogle'),
+            ('css selector', 'div[id^="div-gpt-ad"]'),
+            ('xpath', '//iframe[contains(@id, "google_ads_iframe")]')
         ]
         
         ads_found = []
@@ -611,134 +926,146 @@ class BlogBot:
             self.logger.error(f"Error switching to iframe: {e}")
 
 
-    def handle_google_vignette(self):
-        try:
-            # Try to find and click the full screen overlay ad
-            overlay = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.google-vignette-overlay"))
-            )
-            self.safe_click(overlay)
-            self.logger.info("Clicked on Google Vignette overlay")
-            time.sleep(2)  # Wait for any action to complete
+# def handle_google_vignette(self):
+    #     try:
+    #         # Try to find and click the full screen overlay ad
+    #         overlay = WebDriverWait(self.driver, 10).until(
+    #             EC.presence_of_element_located((By.CSS_SELECTOR, "div.google-vignette-overlay"))
+    #         )
+    #         self.safe_click(overlay)
+    #         self.logger.info("Clicked on Google Vignette overlay")
+    #         time.sleep(2)  # Wait for any action to complete
 
-            # If clicking doesn't work, try to close it
-            close_button = self.driver.find_element(By.CSS_SELECTOR, "div.google-vignette-close-button")
-            if close_button:
-                self.safe_click(close_button)
-                self.logger.info("Closed Google Vignette overlay")
-                time.sleep(2)
+    #         # If clicking doesn't work, try to close it
+    #         close_button = self.driver.find_element(By.CSS_SELECTOR, "div.google-vignette-close-button")
+    #         if close_button:
+    #             self.safe_click(close_button)
+    #             self.logger.info("Closed Google Vignette overlay")
+    #             time.sleep(2)
 
-            # If all else fails, return to the main URL
-            if "#google_vignette" in self.driver.current_url:
-                self.driver.get(f"{self.main_url}")
-                self.wait_for_page_load()
-                self.logger.info("Returned to main URL to bypass Google Vignette")
+    #         # If all else fails, return to the main URL
+    #         if "#google_vignette" in self.driver.current_url:
+    #             self.driver.get(f"{self.main_url}")
+    #             self.wait_for_page_load()
+    #             self.logger.info("Returned to main URL to bypass Google Vignette")
 
-        except Exception as e:
-            self.logger.error(f"Error handling Google Vignette: {e}")
-            # If we can't handle it, return to the main URL
-            self.driver.get(f"{self.main_url}")
-            self.wait_for_page_load()
-            self.logger.info("Returned to main URL after failing to handle Google Vignette")
+    #     except Exception as e:
+    #         self.logger.error(f"Error handling Google Vignette: {e}")
+    #         # If we can't handle it, return to the main URL
+    #         self.driver.get(f"{self.main_url}")
+    #         self.wait_for_page_load()
+    #         self.logger.info("Returned to main URL after failing to handle Google Vignette")
 
     
-    # def handle_google_vignette(self):
-    #     try:
-    #         overlay_selectors = [
-    #             "div[id^='google_ads_iframe'][style*='position: fixed']",
-    #             "iframe[id^='google_ads_iframe'][style*='position: fixed']",
-    #             "div[id^='google_vignette']",
-    #             "div[class*='google-vignette']",
-    #             "div[class*='vignette-container']"
-    #         ]
+    def handle_google_vignette(self):
+        try:
+            overlay_selectors = [
+                "div[id^='google_ads_iframe'][style*='position: fixed']",
+                "iframe[id^='google_ads_iframe'][style*='position: fixed']",
+                "div[id^='google_vignette']",
+                "div[class*='google-vignette']",
+                "div[class*='vignette-container']"
+            ]
             
-    #         for selector in overlay_selectors:
-    #             try:
-    #                 overlay = WebDriverWait(self.driver, 10).until(
-    #                     EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-    #                 )
-    #                 if overlay.is_displayed() and overlay.size['height'] > self.driver.execute_script("return window.innerHeight") * 0.5:
-    #                     self.logger.info(f"Full-screen overlay ad detected using selector: {selector}")
+            for selector in overlay_selectors:
+                try:
+                    overlay = WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    if overlay.is_displayed() and overlay.size['height'] > self.driver.execute_script("return window.innerHeight") * 0.5:
+                        self.logger.info(f"Full-screen overlay ad detected using selector: {selector}")
                         
-    #                     # Try to find and click the close button
-    #                     close_button_selectors = [
-    #                         "button[aria-label='Close ad']",
-    #                         ".close-button",
-    #                         "#dismiss-button",
-    #                         "div[aria-label='Close ad']",
-    #                         "div[role='button'][aria-label='Close']",
-    #                         "span[aria-label='Close']",
-    #                         "img[alt='close button']",
-    #                         "span[class*='close']",
-    #                         "div[class*='close']",
-    #                         "[class*='dismiss']",
-    #                         "[id*='dismiss']"
-    #                     ]
+                        # Try to click the ad first
+                        if self.click_ad(overlay):
+                            return True
                         
-    #                     for close_selector in close_button_selectors:
-    #                         try:
-    #                             close_button = WebDriverWait(self.driver, 5).until(
-    #                                 EC.element_to_be_clickable((By.CSS_SELECTOR, close_selector))
-    #                             )
-    #                             self.driver.execute_script("arguments[0].click();", close_button)
-    #                             self.safe_click(close_button)
-    #                             self.logger.info(f"Clicked close button on full-screen overlay ad using selector: {close_selector}")
-    #                             time.sleep(2)
-    #                             return True
-    #                         except:
-    #                             continue
+                        # If clicking the ad didn't work, try to close it
+                        if self.close_overlay_ad(overlay):
+                            return True
                         
-    #                     # If no close button found, try to click outside the ad
-    #                     actions = ActionChains(self.driver)
-    #                     actions.move_by_offset(-50, -50).click().perform()
-    #                     self.logger.info("Attempted to close overlay ad by clicking outside")
-    #                     time.sleep(2)
+                        # If no close button found, try to click outside the ad
+                        self.click_outside_ad()
                         
-    #                     # If no close button found, try to click the ad
-    #                     clickable = self.find_clickable_element(overlay)
-    #                     if clickable:
-    #                         self.safe_click(clickable)
-    #                         self.logger.info(f"Clicked on ad: {selector}")
-    #                         return True  # Indicate that an ad was clicked
+                        # If the ad is still present, try to remove it using JavaScript
+                        if self.remove_overlay_using_javascript():
+                            return True
+                        
+                except TimeoutException:
+                    continue
+            
+            self.logger.info("No overlay ad detected or unable to interact with it")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error handling overlay ad: {e}")
+            return False
 
-    #                     # Check if the overlay is still present
-    #                     try:
-    #                         overlay = self.driver.find_element(By.CSS_SELECTOR, selector)
-    #                         if not overlay.is_displayed():
-    #                             self.logger.info("Overlay ad closed successfully")
-    #                             return True
-    #                     except:
-    #                         self.logger.info("Overlay ad closed successfully")
-    #                         return True
-                        
-    #                     # If still present, try to use JavaScript to remove the overlay
-    #                     self.driver.execute_script("""
-    #                         var elements = document.querySelectorAll('div[style*="position: fixed"], div[class*="overlay"], div[class*="modal"]');
-    #                         for(var i=0; i<elements.length; i++){
-    #                             elements[i].parentNode.removeChild(elements[i]);
-    #                         }
-    #                     """)
-    #                     self.logger.info("Attempted to remove overlay ad using JavaScript")
-    #                     time.sleep(2)
-                        
-    #                     # Final check
-    #                     try:
-    #                         overlay = self.driver.find_element(By.CSS_SELECTOR, selector)
-    #                         if not overlay.is_displayed():
-    #                             self.logger.info("Overlay ad removed successfully")
-    #                             return True
-    #                     except:
-    #                         self.logger.info("Overlay ad removed successfully")
-    #                         return True
-                        
-    #             except TimeoutException:
-    #                 continue
-            
-    #         self.logger.info("No overlay ad detected or unable to close")
-    #         return False
-    #     except Exception as e:
-    #         self.logger.error(f"Error handling overlay ad: {e}")
-    #         return False
+    def click_ad(self, overlay):
+        try:
+            clickable = self.find_all_clickable_elements(overlay)
+            if clickable:
+                self.safe_click_with_retry(clickable)
+                self.logger.info(f"Clicked on ad or clickable element within the ad")
+                time.sleep(2)
+                return True
+            else:
+                self.safe_click_with_retry(overlay)
+                self.logger.info(f"Clicked on the overlay itself")
+                time.sleep(2)
+                return True
+        except Exception as e:
+            self.logger.error(f"Error clicking on ad: {e}")
+            return False
+
+    def close_overlay_ad(self, overlay):
+        close_button_selectors = [
+            "button[aria-label='Close ad']", ".close-button", "#dismiss-button",
+            "div[aria-label='Close ad']", "div[role='button'][aria-label='Close']",
+            "span[aria-label='Close']", "img[alt='close button']",
+            "span[class*='close']", "div[class*='close']",
+            "[class*='dismiss']", "[id*='dismiss']"
+        ]
+        
+        for close_selector in close_button_selectors:
+            try:
+                close_button = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, close_selector))
+                )
+                self.driver.execute_script("arguments[0].click();", close_button)
+                self.safe_click(close_button)
+                self.logger.info(f"Clicked close button on full-screen overlay ad using selector: {close_selector}")
+                time.sleep(2)
+                return True
+            except:
+                continue
+        return False
+
+    def click_outside_ad(self):
+        actions = ActionChains(self.driver)
+        actions.move_by_offset(-50, -50).click().perform()
+        self.logger.info("Attempted to close overlay ad by clicking outside")
+        time.sleep(2)
+
+    def remove_overlay_using_javascript(self):
+        self.driver.execute_script("""
+            var elements = document.querySelectorAll('div[style*="position: fixed"], div[class*="overlay"], div[class*="modal"]');
+            for(var i=0; i<elements.length; i++){
+                elements[i].parentNode.removeChild(elements[i]);
+            }
+        """)
+        self.logger.info("Attempted to remove overlay ad using JavaScript")
+        time.sleep(2)
+        
+        # Check if the overlay is still present
+        try:
+            overlay = self.driver.find_element(By.CSS_SELECTOR, self.current_selector)
+            if not overlay.is_displayed():
+                self.logger.info("Overlay ad removed successfully")
+                return True
+        except:
+            self.logger.info("Overlay ad removed successfully")
+            return True
+        
+        return False
     
     def reconnect_browser(self):
         self.logger.info(f"Browser connection lost. Attempting to reconnect...")
@@ -746,7 +1073,8 @@ class BlogBot:
             self.driver.quit()
         except:
             pass
-        self.setup_driver()
+        self.driver = self.initialize_driver(max_retries=3)
+        self.wait = WebDriverWait(self.driver, 10)
         self.driver.get(self.main_url)
         self.logger.info(f"Reconnected to the browser.")
 
@@ -860,6 +1188,54 @@ class BlogBot:
             self.safe_click(random_link)
             self.wait_for_page_load()
 
+
+    def print_progress(self):
+        if self.start_time is None:
+            return
+
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed_time)))
+
+        if self.total_ads_clicked > 0:
+            ads_per_second = self.total_ads_clicked / elapsed_time
+            estimated_total_time = self.max_ads_to_click / ads_per_second
+            estimated_remaining_time = max(0, estimated_total_time - elapsed_time)
+            estimated_remaining_str = str(timedelta(seconds=int(estimated_remaining_time)))
+        else:
+            estimated_remaining_str = "Unknown"
+
+        progress_percentage = (self.total_ads_clicked / self.max_ads_to_click) * 100
+        progress_bar = '█' * int(progress_percentage // 2) + '░' * (50 - int(progress_percentage // 2))
+
+        def format_time(time_str):
+            parts = time_str.split(':')
+            if len(parts) == 3:
+                return f"{int(parts[0]):02d}h {int(parts[1]):02d}m {int(parts[2]):02d}s"
+            elif len(parts) == 2:
+                return f"{int(parts[0]):02d}m {int(parts[1]):02d}s"
+            else:
+                return f"{int(parts[0]):02d}s"
+
+        elapsed_formatted = format_time(elapsed_str)
+        estimated_remaining_formatted = format_time(estimated_remaining_str) if estimated_remaining_str != "Unknown" else "Unknown"
+
+        # Example of how it will be displayed:
+        # ┌──────────────────────────────────────────────────────────────────────────────┐
+        # │ Progress: [██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 52.0%         │
+        # │ Ads Clicked: 26/50                                                           │
+        # │ Elapsed Time: 00h 15m 30s                                                    │
+        # │ Estimated Remaining: 00h 14m 20s                                             │
+        # └──────────────────────────────────────────────────────────────────────────────┘
+
+        print(f"\r┌{'─' * 78}┐\n"
+              f"│ Progress: [{progress_bar}] {progress_percentage:.1f}%{' ' * (17 - len(f'{progress_percentage:.1f}'))}│\n"
+              f"│ Ads Clicked: {self.total_ads_clicked}/{self.max_ads_to_click}{' ' * (54 - len(str(self.total_ads_clicked)) - len(str(self.max_ads_to_click)))}│\n"
+              f"│ Elapsed Time: {elapsed_formatted}{' ' * (62 - len(elapsed_formatted))}│\n"
+              f"│ Estimated Remaining: {estimated_remaining_formatted}{' ' * (54 - len(estimated_remaining_formatted))}│\n"
+              f"└{'─' * 78}┘\n", end="", flush=True)
+
+
     def click_ad_content(self):
         try:
             ad_selectors = [
@@ -882,68 +1258,150 @@ class BlogBot:
                 ad_elements = self.driver.find_elements(*selector)
                 all_ad_elements.extend([(ad, selector) for ad in ad_elements])
             
+            self.logger.info(f"Found {len(all_ad_elements)} potential ad elements")
+
             # Shuffle the list of ad elements
             random.shuffle(all_ad_elements)
+
+            visible_ads_found = False
             
             for ad_element, selector in all_ad_elements:
                 ad_identifier = f"{selector}_{ad_element.location['x']}_{ad_element.location['y']}"
-                if ad_identifier not in self.clicked_ads and ad_element.is_displayed():
-                    self.logger.info(f"Found unclicked visible ad: {selector}")
+
+                if ad_identifier not in self.clicked_ads:
+                    if ad_element.is_displayed() and ad_element.size['height'] > 0 and ad_element.size['width'] > 0:
+                        visible_ads_found = True
+                        self.logger.info(f"Found unclicked visible ad: {selector}")
+                        
+                        # Scroll to the ad
+                        self.scroll_to_element(ad_element)
+                        time.sleep(random.uniform(0.5, 1))  # Reduced wait time
                     
-                    # Scroll to the ad
-                    self.scroll_to_element(ad_element)
-                    time.sleep(random.uniform(1, 2))
-                
-                    self.highlight_element(ad_element)
-                    self.logger.info(f"Highlighted ad: {selector}")
-                    
-                    # # Simulate hover
-                    # actions = ActionChains(self.driver)
-                    # actions.move_to_element(ad_element).perform()
-                    # time.sleep(random.uniform(0.5, 1))
+                        self.highlight_element(ad_element)
+                        self.logger.info(f"Highlighted ad: {selector}")
 
-                    # Switch to iframe if the ad is an iframe
-                    if ad_element.tag_name == 'iframe':
-                        self.driver.switch_to.frame(ad_element)
-                        clickable = self.find_clickable_element_in_frame()
-                        self.driver.switch_to.default_content()
-                    else:
-                        clickable_elements = self.find_all_clickable_elements(ad_element)
-                        self.logger.info(f"Found {len(clickable_elements)} clickable elements within the ad")
-                    
-                    if clickable_elements:
-                        clickable = random.choice(clickable_elements)
-                        current_url = self.driver.current_url
-
-                        try:
-                            self.highlight_element(clickable)
-                            self.logger.info(f"Highlighted clickable element within ad: {clickable.tag_name}")
-
-                            # actions = ActionChains(self.driver)
-                            # actions.move_to_element(clickable).click().perform()
-                            # self.logger.info(f"Clicked on element within ad: {clickable.tag_name}")
-                            # time.sleep(2)
-
-                            if self.safe_click_with_retry(clickable):
-                                time.sleep(2)
-                                if self.driver.current_url != current_url:
-                                    self.clicked_ads.add(ad_identifier)
-                                    self.total_ads_clicked += 1
-                                    self.logger.info(f"Successfully clicked ad. Total ads clicked: {self.total_ads_clicked}")
+                        # Check for #google_vignette in URL
+                        # This code will be executed after all potential ad elements have been processed.
+                        # If no clickable ad content is found, it will check if the current URL contains #google_vignette
+                        # and attempt to close it or navigate back to the main URL.
+                        
+                        if "#google_vignette" in self.driver.current_url:
+                            self.logger.info("Detected #google_vignette in URL, attempting to close it")
+                            try:
+                                close_button = self.driver.find_element(By.CSS_SELECTOR, "div[role='button'][aria-label='Close']")
+                                if close_button.is_displayed():
+                                    close_button.click()
+                                    self.logger.info("Closed #google_vignette ad")
                                     return True
-                                else:
-                                    self.logger.info("Ad click did not result in page change, trying next ad")
-                        except Exception as click_error:
-                            self.logger.error(f"Error clicking ad element: {click_error}")
+                                
+                                self.logger.info("No close button found for #google_vignette ad")
+                                self.logger.info("Attempting to find all clickable elements to close #google_vignette ad")
+                                
+                                clickable_elements = self.find_all_clickable_elements(self.driver.find_element(By.TAG_NAME, 'body'))
+                                for element in clickable_elements:
+                                    try:
+                                        self.highlight_element(element)
+                                        if self.safe_click_with_retry(element):
+                                            self.logger.info("Clicked on a clickable element to close #google_vignette ad")
+                                            return True
+                                    except Exception as e:
+                                        self.logger.error(f"Error clicking element to close #google_vignette ad: {e}")
+                                
+
+                                vignette_handled = self.handle_google_vignette()
+                                if not vignette_handled:
+                                    self.logger.warning("Unable to handle Google Vignette. Refreshing the page...")
+                                    self.driver.refresh()
+                                    self.wait_for_page_load()
+                                    return True
+
+                                self.logger.info("Detected #google_vignette in URL, returning to main URL")
+                                self.driver.get(self.main_url)
+                                self.wait_for_page_load()
+                                self.logger.info("Returned to main URL to bypass Google Vignette")
+
+                                return True
+                            except Exception as e:
+                                self.logger.error(f"Error closing #google_vignette ad: {e}")
+
+                        
+                        # # # Simulate hover
+                        # actions = ActionChains(self.driver)
+                        # actions.move_to_element(ad_element).perform()
+                        # time.sleep(random.uniform(0.5, 1))
+
+                        # Switch to iframe if the ad is an iframe
+                        if ad_element.tag_name == 'iframe':
+                            try:
+                                self.driver.switch_to.frame(ad_element)
+                                clickable_elements = self.find_all_clickable_elements(self.driver.find_element(By.TAG_NAME, 'body'))
+                                self.driver.switch_to.default_content()
+                            except Exception as e:
+                                self.logger.error(f"Error switching to iframe: {e}")
+                                self.driver.switch_to.default_content()
+                                clickable_elements = []
+                        else:
+                            clickable_elements = self.find_all_clickable_elements(ad_element)
+                        
+                        self.logger.info(f"Found {len(clickable_elements)} clickable elements within the ad")
+
+                        if clickable_elements:
+                            clickable = random.choice(clickable_elements)
+                            current_url = self.driver.current_url
+                            original_handles = self.driver.window_handles
+
+                            try:
+                                self.highlight_element(clickable)
+                                self.logger.info(f"Highlighted clickable element within ad: {clickable.tag_name}")
+
+                                if self.safe_click_with_retry(clickable):
+                                    # actions = ActionChains(self.driver)
+                                    # actions.move_to_element(clickable).pause(1).click().perform()
+                                    # self.logger.info(f"Clicked on element within ad: {clickable.tag_name}")
+                                    # time.sleep(2)
+
+                                    # # Use JavaScript to click the element
+                                    # self.driver.execute_script("arguments[0].click();", clickable)
+                                    # self.logger.info(f"Clicked on element within ad using JavaScript: {clickable.tag_name}")
+                                    # time.sleep(2)
+
+                                    if self.driver.current_url != current_url:
+                                        self.clicked_ads.add(ad_identifier)
+                                        self.total_ads_clicked += 1
+                                        self.logger.info(f"Successfully clicked ad. Total ads clicked: {self.total_ads_clicked}")
+                                        return True
+                                    else:
+                                        new_handles = self.driver.window_handles
+                                        if len(new_handles) > len(original_handles):
+                                            self.logger.info("New tab opened after ad click")
+                                            self.clicked_ads.add(ad_identifier)
+                                            self.total_ads_clicked += 1
+                                            self.driver.switch_to.window(new_handles[-1])  # Switch to the new tab
+                                            time.sleep(1)  # Wait for the new page to load
+                                            self.driver.close()  # Close the new tab
+                                            self.driver.switch_to.window(original_handles[0])  # Switch back to the original tab
+                                            return True
+                                        else:
+                                            self.logger.info("Ad click did not result in page change or new tab, trying next ad")
+                                    
+                            except Exception as click_error:
+                                self.logger.error(f"Error clicking ad element: {click_error}")
+                        else:
+                            self.logger.info("No clickable element found within the ad")
+                        
+                        # Switch back to default content if we were in an iframe
+                        if ad_element.tag_name == 'iframe':
+                            self.driver.switch_to.default_content()
+                            self.logger.info("Switched back to default content")
                     else:
-                        self.logger.info("No clickable element found within the ad")
-                    
-                    # Switch back to default content if we were in an iframe
-                    if ad_element.tag_name == 'iframe':
-                        self.driver.switch_to.default_content()
-                        self.logger.info("Switched back to default content")
+                        self.logger.info(f"Ad not visible or has zero dimensions: {selector}")
                 else:
-                    self.logger.info(f"Ad already clicked or not visible: {selector}")
+                    self.logger.info(f"Ad already clicked: {selector}")
+
+            if not visible_ads_found:
+                self.logger.info("No visible ads found, refreshing the page...")
+                self.driver.refresh()
+                self.wait_for_page_load()
 
             self.logger.info("No clickable ad content found")
             return False
@@ -957,11 +1415,25 @@ class BlogBot:
         max_attempts = 5
         attempts = 0
         consecutive_failures = 0
+        target_ad_clicks = self.max_ads_to_click
 
-        while ads_clicked_this_session < 1 and attempts < max_attempts and consecutive_failures < 3:
+        last_print_time = self.start_time
+        while ads_clicked_this_session < target_ad_clicks and attempts < max_attempts and consecutive_failures < 3:
+
+            # Print progress every 5 seconds
+            current_time = time.time()
+            if current_time - last_print_time >= 5:
+                self.print_progress()
+                last_print_time = current_time
+
             self.logger.info(f"Ad search attempt {attempts + 1}/{max_attempts}")
             original_url = self.driver.current_url
             original_handle = self.driver.current_window_handle
+
+            if self.main_url not in original_url:
+                self.logger.info(f"Current URL {original_url} is not part of main site. Navigating back to main site.")
+                self.navigate_with_retry(self.main_url)
+                continue
 
             try:
                 if self.click_ad_content():
@@ -979,11 +1451,10 @@ class BlogBot:
                 else:
                     consecutive_failures += 1
                     self.logger.info(f"No clickable ads found on page: {self.driver.current_url}. Consecutive failures: {consecutive_failures}")
-                    if not self.navigate_to_random_page():
-                        self.navigate_with_retry(self.main_url)
+                    self.navigate_to_random_page()  # Always navigate to a new page
             except TimeoutException:
-                self.logger.warning("Timeout occurred. Refreshing the page.")
-                self.navigate_with_retry(self.driver.current_url)
+                self.logger.warning("Timeout occurred. Navigating to a new page.")
+                self.navigate_to_random_page()
             except Exception as e:
                 self.logger.error(f"Error during ad search: {e}")
                 consecutive_failures += 1
@@ -996,6 +1467,10 @@ class BlogBot:
 
         self.logger.info(f"Total ads clicked in this session: {ads_clicked_this_session}")
         self.logger.info(f"Total ads clicked overall: {self.total_ads_clicked}")
+
+        # Print final progress for this search_and_click_ads session
+        self.print_progress()
+
         return ads_clicked_this_session
 
 
@@ -1240,7 +1715,8 @@ class BlogBot:
                 self.driver.quit()
             except:
                 pass
-            self.setup_driver()
+            self.driver = self.initialize_driver(max_retries=3)
+            self.wait = WebDriverWait(self.driver, 10)
             if self.navigate_with_retry():
                 self.logger.info("Successfully reconnected to the browser.")
             else:
@@ -1254,18 +1730,38 @@ class BlogBot:
             return False
 
 
-
     def run(self):
         try:
             if not self.navigate_with_retry():
                 return
             
+            # if not self.verify_user_agent() or not self.verify_fingerprint():
+            #     self.logger.warning("Browser fingerprint verification failed. Reinitializing driver.")
+            #     old_fingerprint = self.get_current_fingerprint()
+            #     if old_fingerprint:
+            #         self.print_fingerprint(old_fingerprint, "Fingerprint Before Reinitialization")
+
+            #     self.driver.quit()
+            #     self.driver = self.initialize_driver(max_retries=3)
+
+            #     new_fingerprint = self.get_current_fingerprint()
+            #     if new_fingerprint:
+            #         self.print_fingerprint(new_fingerprint, "Fingerprint After Reinitialization")
+
+            #     if not self.navigate_with_retry():
+            #         return
+
+
             self.wait_for_page_load()
             self.logger.info(f"Successfully loaded the page: {self.main_url}")
             
             # Check for #google_vignette in URL
             if "#google_vignette" in self.driver.current_url:
-                self.handle_google_vignette()
+                vignette_handled = self.handle_google_vignette()
+                if not vignette_handled:
+                    self.logger.warning("Unable to handle Google Vignette. Refreshing the page...")
+                    self.driver.refresh()
+                    self.wait_for_page_load()
             
             # Ensure highlight script is injected
             if not self.inject_highlight_script():
@@ -1273,45 +1769,69 @@ class BlogBot:
 
             # Handle consent modal
             self.handle_consent_modal()
-            
+            self.handle_privacy_overlay()
+
             self.simulate_human_behavior()
             self.random_mouse_movement()
             self.take_screenshot("initial")
             
+            # attempts = 0
+            # Set the start time just before entering the main ad-clicking loop
+            self.start_time = time.time()
+            last_print_time = self.start_time
 
-            attempts = 0
-            max_attempts = 40
-
-            while self.total_ads_clicked < 20 and attempts < max_attempts:
+            while self.total_ads_clicked < self.max_ads_to_click:
                 try:
                     self.reconnect_if_necessary()
-                    
-                    # Search for and click ads
-                    self.search_and_click_ads()
-                    
-                    self.logger.info(f"Total ads clicked so far: {self.total_ads_clicked}")
+
+                    # Add a timeout for each iteration
+                    start_time = time.time()
+                    while time.time() - start_time < 60:  # 60 seconds timeout
+                        # Search for and click ads more aggressively
+                        ads_clicked = self.search_and_click_ads()
+                        if ads_clicked == 0:
+                            # If no ads were clicked, navigate to a new page
+                            if not self.navigate_to_random_page():
+                                self.navigate_with_retry(self.main_url)
+                        
+                        # Print progress every 5 seconds
+                        current_time = time.time()
+                        if current_time - last_print_time >= 5:
+                            self.print_progress()
+                            last_print_time = current_time
+
+                        # Check if we've exceeded the timeout
+                        if current_time - self.start_time > self.ad_click_timeout:
+                            self.logger.warning("Ad click timeout reached. Ending the session.")
+                            break
+
+                        # Check if we're stuck
+                        if self.is_page_stuck():
+                            self.handle_stuck_situation()
+                            break
+                        
+                        time.sleep(1)  # Short sleep to prevent tight looping
 
                     # Perform some random actions
                     # self.simulate_human_behavior()
                     
-                    # Handle consent modal
-                    self.handle_consent_modal()
-                    
                     # Handle other popups and overlays
                     self.detect_and_handle_popups()
-                    self.handle_privacy_overlay()
-                    self.handle_ad_support_modal()
                     
-                    self.take_screenshot(f"action_{attempts}")
-                    time.sleep(random.uniform(2, 5))
-
-                    attempts += 1
+                    # self.take_screenshot(f"action_{attempts}")
+                    # time.sleep(random.uniform(2, 5))
+                    
+                    # attempts += 1
                 except Exception as e:
                     self.logger.error(f"An error occurred during bot execution: {e}")
                     if "Browsing context has been discarded" in str(e):
                         self.reconnect_browser()
+                    
+                    self.handle_stuck_situation()
                     continue
 
+            self.print_progress()  # Print final progress
+            print("\n")  # Move to next line after progress bar
             self.logger.info(f"Final total ads clicked: {self.total_ads_clicked}")
             self.take_screenshot("final")
         except Exception as e:
@@ -1321,6 +1841,7 @@ class BlogBot:
             if self.driver:
                 self.driver.quit()
             self.disconnect_vpn()
+
 
 
     # def run_parallel(self, num_workers=3):
@@ -1350,6 +1871,7 @@ if __name__ == "__main__":
     for attempt in range(max_retries):
         try:
             bot = BlogBot(url, use_vpn=True, vpn_location="US")
+            # bot = BlogBot(url, use_vpn=False)
             bot.run()
             # bot.run_parallel()
             break
